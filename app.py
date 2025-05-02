@@ -55,6 +55,11 @@ if unique_id:
             for key in all_keys:
                 truck.setdefault(key, None)
 
+        # --- Add Comments Column ---
+        for truck in trucks_data:
+            if "Comments" not in truck:
+                truck["Comments"] = None  # Initialize the Comments field if it doesn't exist
+
         # --- Step 3: Flatten fields like Trailers or Trailer Type for editing ---
         flattened_trucks = []
         for truck in trucks_data:
@@ -74,7 +79,20 @@ if unique_id:
             if any(x in col.lower() for x in ["date", "dispatch", "arrival", "eta"]):
                 trucks_df[col] = pd.to_datetime(trucks_df[col], errors="coerce")
 
-        # --- Step 4: Show editable DataFrame ---
+        # --- Ensure IsCancelled column exists and set to False by default ---
+        if "IsCancelled" not in trucks_df.columns:
+            trucks_df["IsCancelled"] = False
+        else:
+            trucks_df["IsCancelled"] = trucks_df["IsCancelled"].fillna(False).astype(bool)
+
+        # --- Sort: active trucks first ---
+        trucks_df = trucks_df.sort_values(by="IsCancelled").reset_index(drop=True)
+
+        # --- Remove Duplicate Columns Based on Headings ---
+        # We assume no column in the table should be duplicated in the headers
+        trucks_df = trucks_df.loc[:, ~trucks_df.columns.duplicated()]
+
+        # --- Step 4: Show single editable table with Comments column ---
         st.markdown("### 📝 Truck Details")
         edited_trucks_df = st.data_editor(
             trucks_df,
@@ -82,6 +100,22 @@ if unique_id:
             num_rows="dynamic",
             key="truck_editor"
         )
+
+        # --- Truck Status Summary ---
+        status_col = None
+        for candidate in ["Truck status", "Status", "Truck Status"]:
+            if candidate in trucks_df.columns:
+                status_col = candidate
+                break
+        
+        if status_col:
+            status_summary = trucks_df[status_col].value_counts()
+            if not status_summary.empty:
+                st.markdown("### 📊 Truck Status Summary:")
+                for label, count in status_summary.items():
+                    st.markdown(f"- **{count} truck(s)** — {label}")
+        else:
+            st.info("No status column found to summarize.")
 
         st.divider()
 
@@ -91,7 +125,6 @@ if unique_id:
                 updated_trucks = []
 
                 for i, edited_row in enumerate(edited_trucks_df.to_dict(orient="records")):
-                    # Skip if row is empty
                     if all((val == "" or val == 0 or pd.isna(val)) for val in edited_row.values()):
                         continue
 
@@ -112,12 +145,10 @@ if unique_id:
                             ]
 
                     if i < len(trucks_data):
-                        # Update original truck object
                         original = copy.deepcopy(trucks_data[i])
                         original.update(cleaned_row)
                         updated_trucks.append(original)
                     else:
-                        # Add new truck
                         base_schema = copy.deepcopy(trucks_data[0]) if trucks_data else {}
                         new_truck = {
                             key: (
@@ -130,7 +161,7 @@ if unique_id:
                         new_truck.update(cleaned_row)
                         updated_trucks.append(new_truck)
 
-                # --- Update MongoDB ---
+                # Update MongoDB
                 result = collection.update_one(
                     {"Unique ID": unique_id},
                     {"$set": {"Trucks": updated_trucks}}
