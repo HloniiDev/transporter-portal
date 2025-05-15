@@ -1,7 +1,7 @@
 import streamlit as st
 from pymongo import MongoClient
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 import copy
 
 # --- MongoDB Setup ---
@@ -42,24 +42,20 @@ if unique_id:
     if not shipment:
         st.warning(f"No shipment found with Unique ID: {unique_id}")
     else:
-        st.success("Shipment found. Edit the truck data below.")
-
+        # st.success("Shipment found. Edit the truck data below.")
         trucks_data = shipment.get("Trucks", [])
 
-        # Step 1: Your required columns (in order)
         desired_columns = [
             "Truck Number", "Horse Number", "Trailer Number", "Driver Name", "Passport NO.", "Contact NO.",
-            "Tonnage", "ETA", "Status", "Current Location", "Load Location", "Destination",
-            "Arrived at Loading point", "Loaded Date", "Dispatch date",
+            "Tonnage", "ETA", "Status","Cargo Description", "Current Location", "Load Location", "Destination",
+            "Arrived at Loading point", "Loaded Date", "Dispatch date","Borders",
             "Date Arrived", "Date offloaded", "Cancel", "Flag", "Comment"
         ]
 
-        # Step 2: Normalize each truck dict
         for truck in trucks_data:
             for col in desired_columns:
                 truck.setdefault(col, None)
 
-        # Step 3: Convert list or dict fields to string if needed
         flattened_trucks = []
         for truck in trucks_data:
             flat_truck = truck.copy()
@@ -73,34 +69,46 @@ if unique_id:
 
         trucks_df = pd.DataFrame(flattened_trucks)
 
-        # Step 4: Convert relevant fields to datetime
+        # --- Convert relevant fields to datetime (date only) ---
         for col in trucks_df.columns:
             if any(x in col.lower() for x in ["date", "dispatch", "arrival", "eta"]):
-                trucks_df[col] = pd.to_datetime(trucks_df[col], errors="coerce")
+                trucks_df[col] = pd.to_datetime(trucks_df[col], errors="coerce").dt.date
 
-        # Step 5: Ensure all required columns exist (again)
+        # Ensure all required columns exist
         for col in desired_columns:
             if col not in trucks_df.columns:
                 trucks_df[col] = None
 
-        # Step 6: Reorder columns strictly
+        # Reorder
         trucks_df = trucks_df[desired_columns]
 
-        # --- Modify 'Cancel' and 'Flag' columns to be checkboxes ---
+        # Modify 'Cancel' and 'Flag' to boolean
         for col in ["Cancel", "Flag"]:
             if col in trucks_df.columns:
                 trucks_df[col] = trucks_df[col].apply(lambda x: True if x else False)
 
-        # Step 7: Editable Table with checkboxes for 'Cancel' and 'Flag'
-        st.markdown("### 📝 Truck Details")
+        # Store original DataFrame for comparison
+        original_trucks_df = trucks_df.copy()
+
+        # --- Truck Editor UI ---
+        st.markdown("### 📝 Truck Details", help="Editable fields below")
         edited_trucks_df = st.data_editor(
             trucks_df,
             use_container_width=True,
             num_rows="dynamic",
+            column_config={
+                col: st.column_config.DateColumn(label=col, format="YYYY-MM-DD")
+                for col in trucks_df.columns
+                if any(x in col.lower() for x in ["date", "dispatch", "arrival", "eta"])
+            },
             key="truck_editor"
         )
 
-        # --- Truck Status Summary (based on "Status") ---
+        # --- Change Detection ---
+        if not original_trucks_df.equals(edited_trucks_df):
+            st.warning("You have unsaved changes. Don't forget to click '💾 Save Changes'!", icon="⚠️")
+
+        # --- Truck Status Summary ---
         if "Status" in trucks_df.columns:
             status_summary = trucks_df["Status"].value_counts()
             if not status_summary.empty:
@@ -110,11 +118,8 @@ if unique_id:
         else:
             st.info("No 'Status' column found to summarize.")
 
-        # --- Truck Summary Section ---
+        # --- Summary Section ---
         st.markdown("### 🚚 Truck Summary")
-        st.write("Here you can summarize the details of the trucks listed in the table.")
-
-        # Example of summary content, adjust as necessary
         total_trucks = len(trucks_df)
         total_cancelled = trucks_df[trucks_df["Cancel"] == True].shape[0]
         total_on_route = trucks_df[trucks_df["Status"] == "On Route"].shape[0]
@@ -127,7 +132,7 @@ if unique_id:
 
         st.divider()
 
-        # Step 9: Save Changes
+        # --- Save Button ---
         if st.button("💾 Save Changes"):
             try:
                 updated_trucks = []
@@ -140,8 +145,8 @@ if unique_id:
                     for key, val in edited_row.items():
                         if pd.isna(val):
                             cleaned_row[key] = None
-                        elif isinstance(val, pd.Timestamp):
-                            cleaned_row[key] = val.to_pydatetime()
+                        elif isinstance(val, date):
+                            cleaned_row[key] = datetime.combine(val, datetime.min.time())
                         else:
                             cleaned_row[key] = val
 
