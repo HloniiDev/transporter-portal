@@ -6,6 +6,8 @@ import copy
 import re
 
 # --- MongoDB Setup ---
+# Ensure your MongoDB URI is correctly configured in Streamlit secrets.
+# Example: mongo_uri = "mongodb+srv://user:pass@cluster.mongodb.net/mydatabase?retryWrites=true&w=majority"
 client = MongoClient(st.secrets["mongo_uri"])
 db = client["seamaster"]
 collection = db["shipments"]
@@ -47,12 +49,12 @@ def get_truck_status(truck_data):
     arrived_at_loading_point = truck_data.get("Arrived at Loading point")
     loaded_date = truck_data.get("Loaded Date")
     dispatch_date = truck_data.get("Dispatch date")
-    date_arrived = truck_data.get("Date Arrived")
+    date_arrived = truck_data.get("Date Arrived") # Arrived at final destination for offloading
     date_offloaded = truck_data.get("Date offloaded")
+
     load_location = truck_data.get("Load Location", "N/A")
     destination = truck_data.get("Destination", "N/A")
-    
-    # Correctly access the Borders object from the truck_data
+
     borders_data = truck_data.get("Borders", {})
 
     # Helper to check if a date exists and is valid (not None and not pd.NaT)
@@ -67,7 +69,7 @@ def get_truck_status(truck_data):
         if pd.isna(d) or d is None or d == "":
             return None
         return d # Return other types as-is if they are not dates or common nulls
-    
+
     # Convert main dates to datetime for comparison
     arrived_at_loading_point_dt = to_datetime_if_date(arrived_at_loading_point)
     loaded_date_dt = to_datetime_if_date(loaded_date)
@@ -80,75 +82,68 @@ def get_truck_status(truck_data):
         return "Offloaded"
     elif is_valid_date(date_arrived_dt):
         return "Arrived for off loading"
-    
+
     # --- Border-related Checks (ONLY if dispatch_date exists) ---
     if is_valid_date(dispatch_date_dt):
-        # Extract and store border names and their corresponding dates from borders_data
-        parsed_borders = {} 
-        for key, value in borders_data.items():
-            # Updated regex to capture any border name
+        parsed_borders = {}
+        # This will hold the border names in the order they appear as keys in the Borders object.
+        # This is crucial for reflecting the logical sequence you've defined in the DB.
+        ordered_border_names = []
+        unique_names_added = set()
+
+        # Iterate through the actual keys of borders_data to preserve order
+        for key in borders_data.keys():
             match_arrival = re.match(r"Actual arrival at (.+)", key)
-            match_dispatch = re.match(r"Actual dispatch from (.+)", key) 
+            match_dispatch = re.match(r"Actual dispatch from (.+)", key)
 
             if match_arrival:
                 border_name = match_arrival.group(1).strip()
-                # Use to_datetime_if_date to ensure proper None handling
-                parsed_borders.setdefault(border_name, {})["arrival_date"] = to_datetime_if_date(value)
+                parsed_borders.setdefault(border_name, {})["arrival_date"] = to_datetime_if_date(borders_data[key])
+                if border_name not in unique_names_added:
+                    ordered_border_names.append(border_name)
+                    unique_names_added.add(border_name)
             elif match_dispatch:
                 border_name = match_dispatch.group(1).strip()
-                # Use to_datetime_if_date to ensure proper None handling
-                parsed_borders.setdefault(border_name, {})["dispatch_date"] = to_datetime_if_date(value)
+                parsed_borders.setdefault(border_name, {})["dispatch_date"] = to_datetime_if_date(borders_data[key])
+                if border_name not in unique_names_added:
+                    ordered_border_names.append(border_name)
+                    unique_names_added.add(border_name)
         
-        # Sort border names based on their arrival date to determine the sequence.
-        # Only consider borders that actually have an arrival date for sorting order.
-        # This will correctly order borders chronologically based on when the truck arrived at them.
-        sorted_border_names = sorted(
-            [name for name, data in parsed_borders.items() if is_valid_date(data.get("arrival_date"))],
-            key=lambda border_name: parsed_borders[border_name]["arrival_date"]
-        )
+        last_cleared_border = None
 
-       # Traverse the borders in reverse to check for "Clearing" status
-        for i in range(len(sorted_border_names) - 1, -1, -1):
-            border = sorted_border_names[i]
-            arrival_dt = parsed_borders[border].get("arrival_date")
-            dispatch_dt = parsed_borders[border].get("dispatch_date")
+        # Iterate through the ordered borders to determine status
+        for i, border_name in enumerate(ordered_border_names):
+            arrival_dt = parsed_borders.get(border_name, {}).get("arrival_date")
+            dispatch_dt = parsed_borders.get(border_name, {}).get("dispatch_date")
 
             if is_valid_date(arrival_dt) and not is_valid_date(dispatch_dt):
-                return f"Clearing at {border}"
-
-        # Determine "Departing from" and "Enroute to" based on border activity
-        last_dispatched_from = None
-        next_enroute_to = None
-
-        # Find the last border the truck dispatched from
-        for border in reversed(sorted_border_names):
-            dispatch_dt = parsed_borders[border].get("dispatch_date")
-            if is_valid_date(dispatch_dt):
-                last_dispatched_from = border
-                break
+                # Truck arrived at this border but hasn't dispatched yet
+                return f"Clearing at {border_name}"
+            elif is_valid_date(arrival_dt) and is_valid_date(dispatch_dt):
+                # Truck arrived and dispatched from this border
+                last_cleared_border = border_name
+                # Continue to the next border in the sequence
+                continue
+            elif not is_valid_date(arrival_dt) and not is_valid_date(dispatch_dt):
+                # Truck has not yet arrived at this border.
+                # If we've dispatched from the load location or a previous border,
+                # this is the next border the truck is enroute to.
+                if last_cleared_border: # Dispatched from a previous border
+                    return f"Departing from {last_cleared_border} enroute to {border_name}"
+                else: # Dispatched from load location, this is the first border in the path
+                    return f"Departing from {load_location} enroute to {border_name}"
         
-        # Find the next border to which it's enroute
-        if last_dispatched_from:
-            try:
-                idx = sorted_border_names.index(last_dispatched_from)
-                if idx + 1 < len(sorted_border_names):
-                    next_enroute_to = sorted_border_names[idx + 1]
-            except ValueError:
-                pass 
+        # If the loop completes, it means the truck has either:
+        # 1. Dispatched from the last defined border (last_cleared_border would be set)
+        # 2. Dispatched from load location, but no borders were defined (ordered_border_names is empty)
         
-        # Scenario 1: Truck has dispatched from initial load location but no border activity yet
-        if is_valid_date(dispatch_date_dt) and not last_dispatched_from:
-            if sorted_border_names:
-                return f"Departing from {load_location} enroute to {sorted_border_names[0]}"
-            else:
-                return f"Departing from {load_location} enroute to {destination}" # If no borders defined, assume enroute to final destination
+        if last_cleared_border:
+            # Dispatched from the last border in the sequence
+            return f"Departing from {last_cleared_border} enroute to {destination}"
+        elif is_valid_date(dispatch_date_dt) and not ordered_border_names:
+            # Dispatched from load location, but no borders defined
+            return f"Departing from {load_location} enroute to {destination}"
 
-        # Scenario 2: Truck has dispatched from a border and is enroute to the next border
-        if last_dispatched_from and next_enroute_to:
-            return f"Departing from {last_dispatched_from} enroute to {next_enroute_to}"
-        # Scenario 3: Truck has dispatched from the last border and is enroute to final destination
-        elif last_dispatched_from and not next_enroute_to:
-            return f"Departing from {last_dispatched_from} enroute to {destination}"
 
     # --- Pre-Dispatch Statuses (These are checked if dispatch_date is None/NaT) ---
     elif is_valid_date(loaded_date_dt):
@@ -156,7 +151,7 @@ def get_truck_status(truck_data):
     elif is_valid_date(arrived_at_loading_point_dt):
         return "Waiting to load"
     else:
-        return "Booked"
+        return "Booked" # Default status if no other conditions are met
 
 # --- Input Unique ID ---
 unique_id = st.text_input("🔎 Enter Shipment Unique ID")
@@ -169,19 +164,39 @@ if unique_id:
     else:
         trucks_data = shipment.get("Trucks", [])
 
+        # This function extracts and orders keys for display in st.data_editor.
+        # It prioritizes the order found in a sample MongoDB document's dictionary keys.
         def extract_ordered_keys(data_list, field):
-            all_relevant_keys = set()
-            for item in data_list:
-                if isinstance(item.get(field), dict):
-                    all_relevant_keys.update(item[field].keys())
-            
             if field == "Borders":
-                sorted_keys = sorted(list(all_relevant_keys), key=lambda x: (
-                    re.match(r"(?:Actual arrival at|Actual dispatch from) (.+)", x).group(1).strip(),
-                    0 if "arrival" in x else 1
-                ))
-                return sorted_keys
-            else:
+                # Find a sample truck with border data to infer order
+                sample_borders_keys = []
+                for item in data_list:
+                    if isinstance(item.get("Borders"), dict) and item["Borders"]:
+                        sample_borders_keys = list(item["Borders"].keys())
+                        break # Found a sample, use its keys for initial order
+
+                # Collect all unique border keys across all trucks
+                all_unique_border_keys = set()
+                for item in data_list:
+                    if isinstance(item.get("Borders"), dict):
+                        all_unique_border_keys.update(item["Borders"].keys())
+
+                # Start with the order from the sample, then add any missing keys
+                ordered_keys = []
+                for key in sample_borders_keys:
+                    if key in all_unique_border_keys:
+                        ordered_keys.append(key)
+                        all_unique_border_keys.discard(key) # Remove to track remaining
+
+                # Add any remaining keys that were not in the sample (sorted to be consistent)
+                ordered_keys.extend(sorted(list(all_unique_border_keys)))
+
+                return ordered_keys
+            else: # For other fields like 'Trailers', just sort alphabetically
+                all_relevant_keys = set()
+                for item in data_list:
+                    if isinstance(item.get(field), dict):
+                        all_relevant_keys.update(item[field].keys())
                 return sorted(list(all_relevant_keys))
 
 
@@ -194,7 +209,8 @@ if unique_id:
         required_post_border_date_fields = [
             "Date Arrived", "Date offloaded"
         ]
-        
+
+        # Define the desired order of columns for the DataFrame
         desired_columns = [
             "Truck Number", "Horse Number"
         ] + trailer_keys + [
@@ -204,20 +220,27 @@ if unique_id:
         ] + required_pre_border_date_fields + border_keys + required_post_border_date_fields + [
             "Cancel", "Flag", "Comment"
         ]
-        
+
+        # Ensure "Status" is correctly placed if not already in desired_columns
         if "Status" not in desired_columns:
-            desired_columns.insert(desired_columns.index("ETA") + 1, "Status")
+            # Insert after ETA if ETA is present, otherwise at a logical default
+            if "ETA" in desired_columns:
+                desired_columns.insert(desired_columns.index("ETA") + 1, "Status")
+            else:
+                desired_columns.insert(0, "Status") # Fallback to beginning if ETA not found
 
 
         flattened_trucks = []
         for truck in trucks_data:
             flat_truck = {}
+            # Initialize all date fields that might be missing
             for field in required_pre_border_date_fields + required_post_border_date_fields:
                 if field not in truck:
                     truck[field] = None
 
             current_truck_borders = truck.get("Borders", {})
 
+            # Populate flat_truck with data based on desired_columns order
             for col in desired_columns:
                 if col in trailer_keys:
                     flat_truck[col] = truck.get("Trailers", {}).get(col, "")
@@ -226,58 +249,66 @@ if unique_id:
                 else:
                     flat_truck[col] = truck.get(col, None)
             
+            # Recalculate status for each truck based on its current data
             flat_truck["Status"] = get_truck_status(truck)
             
             flattened_trucks.append(flat_truck)
 
         trucks_df = pd.DataFrame(flattened_trucks)
 
+        # Convert date columns to date objects for Streamlit's DateColumn
         for col in trucks_df.columns:
             if any(x in col.lower() for x in ["date", "dispatch", "arrival", "eta"]):
                 trucks_df[col] = pd.to_datetime(trucks_df[col], errors="coerce").dt.date
-            # Explicitly convert "Arrived at Loading point" to date
+            # Explicitly convert "Arrived at Loading point" to date as well
             elif col == "Arrived at Loading point":
                 trucks_df[col] = pd.to_datetime(trucks_df[col], errors="coerce").dt.date
 
-
+        # Ensure all desired columns exist in the DataFrame, adding as None if missing
         for col in desired_columns:
             if col not in trucks_df.columns:
                 trucks_df[col] = None
 
+        # Reorder DataFrame columns to match desired_columns
         trucks_df = trucks_df[desired_columns]
 
+        # Convert Cancel/Flag to boolean for correct display in st.data_editor checkboxes
         for col in ["Cancel", "Flag"]:
             if col in trucks_df.columns:
                 trucks_df[col] = trucks_df[col].apply(lambda x: True if x else False)
 
+        # Store a copy of the original DataFrame to detect changes
         original_trucks_df = trucks_df.copy()
 
-        # Column Configs - MODIFIED HERE TO EXPLICITLY INCLUDE "Arrived at Loading point"
+        # Define column configurations for st.data_editor
         column_config = {
             col: st.column_config.DateColumn(label=col, format="YYYY-MM-DD")
             for col in trucks_df.columns
             if any(x in col.lower() for x in ["date", "dispatch", "arrival", "eta"]) or col in border_keys
-            or col == "Arrived at Loading point" # <<< ADDED THIS LINE
+            or col == "Arrived at Loading point"
         }
         
         column_config["Status"] = st.column_config.TextColumn(
             label="Status",
-            disabled=True
+            disabled=True # Status is auto-calculated, so it should not be editable
         )
-
+        # Configure other specific column types if needed (e.g., NumberColumn for Tonnage, TextColumn for Driver Name etc.)
+        # For simplicity, default text/number columns are usually handled well by st.data_editor without explicit config.
 
         st.markdown("### 📝 Truck Details", help="Editable fields below")
         edited_trucks_df = st.data_editor(
             trucks_df,
             use_container_width=True,
-            num_rows="dynamic",
+            num_rows="dynamic", # Allows adding/removing rows
             column_config=column_config,
             key="truck_editor"
         )
 
+        # Warn user about unsaved changes
         if not original_trucks_df.equals(edited_trucks_df):
-            st.warning("You have unsaved changes. Don't forget to click '📎 Save Changes'!', icon='⚠️'")
+            st.warning("You have unsaved changes. Don't forget to click '📎 Save Changes'!", icon='⚠️')
 
+        # Display status summary
         if "Status" in edited_trucks_df.columns:
             status_summary = edited_trucks_df["Status"].value_counts()
             if not status_summary.empty:
@@ -291,15 +322,14 @@ if unique_id:
         total_trucks = len(edited_trucks_df)
         total_cancelled = edited_trucks_df[edited_trucks_df["Cancel"] == True].shape[0]
         
+        # Count trucks "enroute" including those "Clearing" at a border
         total_on_route = edited_trucks_df[edited_trucks_df["Status"].str.contains("enroute|Clearing", case=False, na=False)].shape[0]
         total_at_destination = edited_trucks_df[edited_trucks_df["Status"] == "Arrived for off loading"].shape[0]
-
 
         st.markdown(f"- **Total Trucks**: {total_trucks}")
         st.markdown(f"- **Cancelled Trucks**: {total_cancelled}")
         st.markdown(f"- **Trucks Enroute (including Clearing)**: {total_on_route}")
         st.markdown(f"- **Trucks Arrived for Offloading**: {total_at_destination}")
-
 
         st.divider()
 
@@ -308,11 +338,13 @@ if unique_id:
                 updated_trucks = []
 
                 for i, edited_row_dict in enumerate(edited_trucks_df.to_dict(orient="records")):
+                    # Skip rows that are entirely empty (e.g., newly added empty rows)
                     if all((val == "" or val == 0 or pd.isna(val) or val is None) for key, val in edited_row_dict.items() if key not in ["Cancel", "Flag"]):
                         continue
 
                     edited_row = copy.deepcopy(edited_row_dict)
 
+                    # Separate Trailers and Borders data back into nested dictionaries
                     trailers_data = {key: edited_row.pop(key) for key in trailer_keys if key in edited_row}
                     
                     borders_data = {}
@@ -327,6 +359,7 @@ if unique_id:
                             else:
                                 borders_data[key] = edited_val
 
+                    # Clean up other fields (convert NaT/empty strings to None, convert dates to datetime)
                     cleaned_row = {}
                     for key, val in edited_row.items():
                         if pd.isna(val) or val is None or val == "":
@@ -336,16 +369,21 @@ if unique_id:
                         else:
                             cleaned_row[key] = val
                     
+                    # Re-assign nested dictionaries
                     cleaned_row["Trailers"] = trailers_data
                     cleaned_row["Borders"] = borders_data
                     
+                    # Recalculate status just before saving to ensure it's up-to-date with current data
                     cleaned_row["Status"] = get_truck_status(cleaned_row)
 
+                    # Handle existing vs. new trucks
                     if i < len(trucks_data):
+                        # Update existing truck's data
                         original = copy.deepcopy(trucks_data[i])
                         if "_id" in original:
-                            del original["_id"] 
+                            del original["_id"] # Remove MongoDB _id before merging/updating
                         
+                        # Merge updated data into original, ensuring nested structures are handled
                         for key, value in cleaned_row.items():
                             if key == "Trailers":
                                 original.setdefault("Trailers", {}).update(value)
@@ -355,6 +393,8 @@ if unique_id:
                                 original[key] = value
                         updated_trucks.append(original)
                     else:
+                        # This is a new truck added via 'Add row'
+                        # Create a base schema for a new truck if no existing trucks, otherwise copy schema from first truck
                         if not trucks_data:
                             new_truck = {
                                 "Truck Number": None, "Horse Number": None, "Driver Name": None,
@@ -367,33 +407,37 @@ if unique_id:
                                 "Trailers": {}, "Borders": {}
                             }
                         else:
+                            # Create a new truck with a schema similar to existing trucks
                             base_schema = copy.deepcopy(trucks_data[0])
                             for k in base_schema:
                                 if k not in ["_id", "Trailers", "Borders"]:
                                     base_schema[k] = None
                             if "_id" in base_schema:
                                 del base_schema["_id"]
+                            base_schema["Trailers"] = {}
+                            base_schema["Borders"] = {}
                             new_truck = base_schema
 
                         new_truck.update(cleaned_row)
                         updated_trucks.append(new_truck)
                 
+                # Filter out any completely empty new rows that might have been added
                 final_trucks_to_save = [
                     truck for truck in updated_trucks 
                     if not all((val == "" or val == 0 or val is None or pd.isna(val) or (isinstance(val, dict) and not val)) for key, val in truck.items() if key not in ["Cancel", "Flag"])
                 ]
 
-
+                # Update the shipment in MongoDB
                 result = collection.update_one(
                     {"Unique ID": unique_id},
                     {"$set": {"Trucks": final_trucks_to_save}}
                 )
 
-                if result.modified_count >= 0:
+                if result.modified_count >= 0: # modified_count can be 0 if no actual changes were made to the document
                     st.success("✅ Shipment updated successfully. Refreshing data...")
-                    st.rerun()
+                    st.rerun() # Rerun to show updated data and status
                 else:
-                    st.info("ℹ️ No changes were made.")
+                    st.info("ℹ️ No changes were made to the shipment document.")
 
             except Exception as e:
                 st.error(f"❌ Failed to update shipment: {e}")
