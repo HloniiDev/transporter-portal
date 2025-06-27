@@ -68,6 +68,12 @@ def get_truck_status(truck_data):
         # If it's pd.NaT, an empty string, or None, return None
         if pd.isna(d) or d is None or d == "":
             return None
+        # Try to convert string to datetime if possible
+        if isinstance(d, str):
+            try:
+                return pd.to_datetime(d).to_pydatetime()
+            except ValueError:
+                pass
         return d # Return other types as-is if they are not dates or common nulls
 
     # Convert main dates to datetime for comparison
@@ -86,8 +92,6 @@ def get_truck_status(truck_data):
     # --- Border-related Checks (ONLY if dispatch_date exists) ---
     if is_valid_date(dispatch_date_dt):
         parsed_borders = {}
-        # This will hold the border names in the order they appear as keys in the Borders object.
-        # This is crucial for reflecting the logical sequence you've defined in the DB.
         ordered_border_names = []
         unique_names_added = set()
 
@@ -178,8 +182,8 @@ if unique_id:
                 # Collect all unique border keys across all trucks
                 all_unique_border_keys = set()
                 for item in data_list:
-                    if isinstance(item.get("Borders"), dict):
-                        all_unique_border_keys.update(item["Borders"].keys())
+                    if isinstance(item.get(field), dict):
+                        all_unique_border_keys.update(item[field].keys())
 
                 # Start with the order from the sample, then add any missing keys
                 ordered_keys = []
@@ -280,6 +284,119 @@ if unique_id:
         # Store a copy of the original DataFrame to detect changes
         original_trucks_df = trucks_df.copy()
 
+        # --- Shipment Summary Section ---
+        st.markdown("### 📊 Shipment Summary")
+
+        total_trucks = len(trucks_data)
+        offloaded_trucks_count = 0
+        dispatched_trucks_count = 0
+        total_tonnage = 0.0
+        offloaded_tonnage = 0.0
+        all_dates = []
+
+        # Assuming 'Transporter', 'Cargo Type', 'Load Location', 'Destination'
+        # are top-level fields in the shipment document or derived from the first truck.
+        # Prioritize shipment-level fields if they exist, otherwise fallback to truck-level.
+        transporter = shipment.get("Transporter")
+        cargo_type = shipment.get("Cargo Type")
+        
+        # For Load Location and Destination, check shipment level first, then truck level
+        shipment_load_location = shipment.get("Load Location")
+        shipment_destination = shipment.get("Destination")
+
+        # If shipment-level Load Location/Destination aren't found, try from the first truck
+        if not shipment_load_location and trucks_data:
+            shipment_load_location = trucks_data[0].get("Load Location", "N/A")
+        if not shipment_destination and trucks_data:
+            shipment_destination = trucks_data[0].get("Destination", "N/A")
+
+        # Loop through the *original* `trucks_data` for summary calculations
+        # This ensures the summary reflects the initial loaded state, not the edited one.
+        for truck in trucks_data:
+            status = get_truck_status(truck) # Get current status for summary
+            tonnage = truck.get("Tonnage")
+            
+            if tonnage is not None and isinstance(tonnage, (int, float)):
+                total_tonnage += tonnage
+
+            if status == "Offloaded":
+                offloaded_trucks_count += 1
+                if tonnage is not None and isinstance(tonnage, (int, float)):
+                    offloaded_tonnage += tonnage
+            
+            if truck.get("Dispatch date") is not None and not pd.isna(truck.get("Dispatch date")):
+                dispatched_trucks_count += 1
+
+            # Collect all relevant dates
+            date_fields_to_check = [
+                "Arrived at Loading point", "Loaded Date", "Dispatch date",
+                "Date Arrived", "Date offloaded"
+            ]
+            for field in date_fields_to_check:
+                dt = truck.get(field)
+                if isinstance(dt, datetime) or isinstance(dt, date):
+                    all_dates.append(dt)
+                elif isinstance(dt, str): # Try to parse string dates
+                    try:
+                        parsed_dt = pd.to_datetime(dt)
+                        if pd.notna(parsed_dt):
+                            all_dates.append(parsed_dt.to_pydatetime())
+                    except:
+                        pass
+            
+            # Add border dates
+            borders = truck.get("Borders", {})
+            for key, val in borders.items():
+                if isinstance(val, datetime) or isinstance(val, date):
+                    all_dates.append(val)
+                elif isinstance(val, str):
+                    try:
+                        parsed_dt = pd.to_datetime(val)
+                        if pd.notna(parsed_dt):
+                            all_dates.append(parsed_dt.to_pydatetime())
+                    except:
+                        pass
+        
+        # Calculate progress and format tonnage
+        progress_percent = (offloaded_trucks_count / total_trucks) * 100 if total_trucks > 0 else 0
+        
+        tons_moved_str = f"{offloaded_tonnage:.0f}T/{total_tonnage:.0f}T" if total_tonnage > 0 else "0T/0T"
+
+        # Determine date range
+        min_date, max_date = None, None
+        if all_dates:
+            # Ensure all dates are datetime objects before min/max
+            all_dates_dt = [d if isinstance(d, datetime) else datetime.combine(d, datetime.min.time()) for d in all_dates if d is not None and pd.notna(d)]
+            if all_dates_dt:
+                min_date = min(all_dates_dt).date()
+                max_date = max(all_dates_dt).date()
+
+        date_range_str = "N/A"
+        if min_date and max_date:
+            date_range_str = f"{min_date.strftime('%d %b')} – {max_date.strftime('%d %b')}"
+
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"**Shipment Unique ID:** {unique_id}")
+            st.write(f"**Transporter:** {transporter if transporter else 'N/A'}")
+            st.write(f"**Cargo Type:** {cargo_type if cargo_type else 'N/A'}")
+            st.write(f"**Loading Point:** {shipment_load_location if shipment_load_location else 'N/A'}")
+            st.write(f"**Destination:** {shipment_destination if shipment_destination else 'N/A'}")
+
+        with col2:
+            st.write(f"**Tons Moved:** {tons_moved_str}")
+            st.write(f"**Dispatched:** {dispatched_trucks_count} / {total_trucks} Trucks")
+            st.write(f"**Offloaded:** {offloaded_trucks_count} / {total_trucks} Trucks")
+            st.write(f"**Date Range:** {date_range_str}")
+            st.markdown(f"**Progress:**")
+            st.progress(progress_percent / 100, text=f"{progress_percent:.0f}%")
+        
+        st.divider() # Add a divider after the summary
+
+        # --- End Shipment Summary Section ---
+
+
         # Define column configurations for st.data_editor
         column_config = {
             col: st.column_config.DateColumn(label=col, format="YYYY-MM-DD")
@@ -319,17 +436,19 @@ if unique_id:
             st.info("No 'Status' column found to summarize.")
 
         st.markdown("### 🚚 Truck Summary")
-        total_trucks = len(edited_trucks_df)
+        total_trucks = len(edited_trucks_df) # This should ideally be based on the edited_trucks_df now
         total_cancelled = edited_trucks_df[edited_trucks_df["Cancel"] == True].shape[0]
         
         # Count trucks "enroute" including those "Clearing" at a border
         total_on_route = edited_trucks_df[edited_trucks_df["Status"].str.contains("enroute|Clearing", case=False, na=False)].shape[0]
         total_at_destination = edited_trucks_df[edited_trucks_df["Status"] == "Arrived for off loading"].shape[0]
+        total_offloaded_edited = edited_trucks_df[edited_trucks_df["Status"] == "Offloaded"].shape[0]
 
         st.markdown(f"- **Total Trucks**: {total_trucks}")
         st.markdown(f"- **Cancelled Trucks**: {total_cancelled}")
         st.markdown(f"- **Trucks Enroute (including Clearing)**: {total_on_route}")
         st.markdown(f"- **Trucks Arrived for Offloading**: {total_at_destination}")
+        st.markdown(f"- **Trucks Offloaded**: {total_offloaded_edited}") # Added this as it's key for the summary
 
         st.divider()
 
@@ -339,7 +458,7 @@ if unique_id:
 
                 for i, edited_row_dict in enumerate(edited_trucks_df.to_dict(orient="records")):
                     # Skip rows that are entirely empty (e.g., newly added empty rows)
-                    if all((val == "" or val == 0 or pd.isna(val) or val is None) for key, val in edited_row_dict.items() if key not in ["Cancel", "Flag"]):
+                    if all((val == "" or val == 0 or pd.isna(val) or val is None or (isinstance(val, dict) and not val)) for key, val in edited_row_dict.items() if key not in ["Cancel", "Flag"]):
                         continue
 
                     edited_row = copy.deepcopy(edited_row_dict)
@@ -377,47 +496,43 @@ if unique_id:
                     cleaned_row["Status"] = get_truck_status(cleaned_row)
 
                     # Handle existing vs. new trucks
-                    if i < len(trucks_data):
+                    # Attempt to find the original truck based on "Truck Number" or "Horse Number" if available
+                    # Otherwise, rely on index for existing rows and append for new.
+                    original_truck_found = None
+                    if "Truck Number" in cleaned_row and cleaned_row["Truck Number"] is not None:
+                        for original_t in trucks_data:
+                            if original_t.get("Truck Number") == cleaned_row["Truck Number"]:
+                                original_truck_found = original_t
+                                break
+                    
+                    if original_truck_found:
                         # Update existing truck's data
-                        original = copy.deepcopy(trucks_data[i])
-                        if "_id" in original:
-                            del original["_id"] # Remove MongoDB _id before merging/updating
+                        if "_id" in original_truck_found:
+                            del original_truck_found["_id"] # Remove MongoDB _id before merging/updating
                         
                         # Merge updated data into original, ensuring nested structures are handled
                         for key, value in cleaned_row.items():
                             if key == "Trailers":
-                                original.setdefault("Trailers", {}).update(value)
+                                original_truck_found.setdefault("Trailers", {}).update(value)
                             elif key == "Borders":
-                                original.setdefault("Borders", {}).update(value)
+                                original_truck_found.setdefault("Borders", {}).update(value)
                             else:
-                                original[key] = value
-                        updated_trucks.append(original)
+                                original_truck_found[key] = value
+                        updated_trucks.append(original_truck_found)
                     else:
-                        # This is a new truck added via 'Add row'
-                        # Create a base schema for a new truck if no existing trucks, otherwise copy schema from first truck
-                        if not trucks_data:
-                            new_truck = {
-                                "Truck Number": None, "Horse Number": None, "Driver Name": None,
-                                "Passport NO.": None, "Contact NO.": None, "Tonnage": None,
-                                "ETA": None, "Status": None, "Cargo Description": None,
-                                "Current Location": None, "Load Location": None, "Destination": None,
-                                "Arrived at Loading point": None, "Loaded Date": None,
-                                "Dispatch date": None, "Date Arrived": None, "Date offloaded": None,
-                                "Cancel": False, "Flag": False, "Comment": None,
-                                "Trailers": {}, "Borders": {}
-                            }
-                        else:
-                            # Create a new truck with a schema similar to existing trucks
-                            base_schema = copy.deepcopy(trucks_data[0])
-                            for k in base_schema:
-                                if k not in ["_id", "Trailers", "Borders"]:
-                                    base_schema[k] = None
-                            if "_id" in base_schema:
-                                del base_schema["_id"]
-                            base_schema["Trailers"] = {}
-                            base_schema["Borders"] = {}
-                            new_truck = base_schema
-
+                        # This is either a brand new truck or one whose ID was changed.
+                        # For now, treat it as a new truck.
+                        # Create a base schema for a new truck
+                        new_truck = {
+                            "Truck Number": None, "Horse Number": None, "Driver Name": None,
+                            "Passport NO.": None, "Contact NO.": None, "Tonnage": None,
+                            "ETA": None, "Status": None, "Cargo Description": None,
+                            "Current Location": None, "Load Location": None, "Destination": None,
+                            "Arrived at Loading point": None, "Loaded Date": None,
+                            "Dispatch date": None, "Date Arrived": None, "Date offloaded": None,
+                            "Cancel": False, "Flag": False, "Comment": None,
+                            "Trailers": {}, "Borders": {}
+                        }
                         new_truck.update(cleaned_row)
                         updated_trucks.append(new_truck)
                 
